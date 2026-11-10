@@ -28,6 +28,7 @@ from airflow.providers.common.ai.durable import journal as journal_module
 from airflow.providers.common.ai.durable.base import build_run_meta_key, build_step_key
 from airflow.providers.common.ai.durable.journal import (
     DurableJournal,
+    DurableRun,
     current_journal,
     journal_scope,
 )
@@ -306,6 +307,189 @@ class TestFailures:
         )
 
         assert summary == "summary of v2"
+
+
+async def model_then_failing_tool(
+    durable_run: DurableRun, answer: str, *, fingerprinted: bool = True
+) -> tuple[str, ValueError]:
+    """
+    Fail ``durable_run`` in the tool call its model chose, and return the model's choice and the error.
+
+    ``answer`` is what the model chooses when it is asked rather than replayed. The tool call's
+    fingerprint is the model's choice, as a real tool call's carries the model's call id.
+    """
+    chosen = await durable_run.run("model", kind="model", fingerprint="m", body=lambda: ok(answer))
+    error = ValueError(f"bad arguments: {chosen}")
+    with pytest.raises(ValueError, match="bad arguments"):
+        await durable_run.run(
+            "query", kind="tool", fingerprint=chosen if fingerprinted else None, body=lambda: raise_(error)
+        )
+    durable_run.fail(error)
+    return chosen, error
+
+
+async def attempt_failing_in_tool(storage, answer: str, *, fingerprinted: bool = True) -> str:
+    """Run one attempt that fails in the tool call the model chose, and return the model's choice."""
+    chosen, _ = await model_then_failing_tool(
+        DurableJournal(storage).start_run(), answer, fingerprinted=fingerprinted
+    )
+    return chosen
+
+
+def asked_model_again(log: mock.MagicMock) -> list[int]:
+    """The ``attempts`` of each warning that a retry asks the model again."""
+    return [
+        warning.kwargs["attempts"]
+        for warning in log.warning.call_args_list
+        if "same tool call failed" in warning.args[0]
+    ]
+
+
+class TestRepeatedToolFailures:
+    @pytest.mark.parametrize("fingerprinted", [True, False], ids=["fingerprinted", "no fingerprint"])
+    @pytest.mark.asyncio
+    async def test_a_tool_call_that_fails_twice_in_a_row_makes_the_next_retry_ask_the_model_again(
+        self, memory_storage, fingerprinted
+    ):
+        """Each call the model chooses is retried once as it was, then the model is asked for another."""
+        with mock.patch.object(journal_module, "log", spec=["debug", "warning"]) as log:
+            chosen = [
+                await attempt_failing_in_tool(memory_storage, f"call {n}", fingerprinted=fingerprinted)
+                for n in range(1, 6)
+            ]
+
+        assert chosen == ["call 1", "call 1", "call 3", "call 3", "call 5"]
+        assert asked_model_again(log) == [2, 2]
+
+    @pytest.mark.asyncio
+    async def test_an_attempt_that_fails_before_the_tool_starts_the_count_over(self, memory_storage):
+        await attempt_failing_in_tool(memory_storage, "call 1")
+        killed = DurableJournal(memory_storage).start_run()
+        await killed.run("model", kind="model", fingerprint="m", body=lambda: ok("replayed, never asked"))
+        killed.fail(TimeoutError("killed"))
+        chosen = [await attempt_failing_in_tool(memory_storage, f"call {n}") for n in range(3, 6)]
+
+        assert chosen == ["call 1", "call 1", "call 5"]
+
+    @pytest.mark.parametrize("through_operation", [False, True], ids=["from the tool", "from an operation"])
+    @pytest.mark.asyncio
+    async def test_a_tool_inside_a_nested_agent_failing_twice_asks_only_the_nested_model_again(
+        self, memory_storage, through_operation
+    ):
+        """The outer model chose the agent tool, not the arguments that failed, so its answer still replays."""
+
+        async def attempt(answer: str) -> tuple[str, str]:
+            journal = DurableJournal(memory_storage)
+            outer = journal.start_run()
+            outer_choice = await outer.run(
+                "model", kind="model", fingerprint="outer", body=lambda: ok(f"outer {answer}")
+            )
+            inner_choice: list[str] = []
+
+            async def run_agent():
+                chosen, error = await model_then_failing_tool(journal.start_run(), f"inner {answer}")
+                inner_choice.append(chosen)
+                raise error
+
+            async def ask_agent():
+                if through_operation:
+                    # Such as another capability's durable operation that the tool calls.
+                    await outer.run("operation", kind="other", fingerprint=None, body=run_agent)
+                else:
+                    await run_agent()
+
+            with pytest.raises(ValueError, match="bad arguments") as raised:
+                await outer.run("ask_agent", kind="tool", fingerprint=outer_choice, body=ask_agent)
+            outer.fail(raised.value)
+            return outer_choice, inner_choice[0]
+
+        choices = [await attempt(str(n)) for n in range(1, 4)]
+
+        assert choices == [("outer 1", "inner 1"), ("outer 1", "inner 1"), ("outer 1", "inner 3")]
+
+    @pytest.mark.asyncio
+    async def test_a_nested_agent_whose_model_request_keeps_failing_leaves_it_to_the_tool_that_ran_it(
+        self, memory_storage
+    ):
+        """No tool call of the nested agent failed, so the outer model's arguments to it are what to change."""
+
+        async def attempt(answer: str) -> str:
+            journal = DurableJournal(memory_storage)
+            outer = journal.start_run()
+            outer_choice = await outer.run(
+                "model", kind="model", fingerprint="outer", body=lambda: ok(f"outer {answer}")
+            )
+
+            async def ask_agent():
+                inner = journal.start_run()
+                error = ValueError("bad arguments: the request is too long for the model")
+                try:
+                    await inner.run("model", kind="model", fingerprint="inner", body=lambda: raise_(error))
+                except ValueError:
+                    inner.fail(error)
+                    raise
+
+            with pytest.raises(ValueError, match="bad arguments") as raised:
+                await outer.run("ask_agent", kind="tool", fingerprint=outer_choice, body=ask_agent)
+            outer.fail(raised.value)
+            return outer_choice
+
+        choices = [await attempt(str(n)) for n in range(1, 4)]
+
+        assert choices == ["outer 1", "outer 1", "outer 3"]
+
+    @pytest.mark.asyncio
+    async def test_a_fallback_agent_started_while_handling_another_runs_failure_counts_its_own(
+        self, memory_storage
+    ):
+        """Its error carries the first run's error as context, but that run is not inside its tool call."""
+
+        async def attempt(answer: str) -> str:
+            journal = DurableJournal(memory_storage)
+            _, primary_error = await model_then_failing_tool(journal.start_run(), f"primary {answer}")
+            try:
+                raise primary_error
+            except ValueError:
+                fallback_choice, _ = await model_then_failing_tool(journal.start_run(), f"fallback {answer}")
+            return fallback_choice
+
+        choices = [await attempt(str(n)) for n in range(1, 4)]
+
+        assert choices == ["fallback 1", "fallback 1", "fallback 3"]
+
+    @pytest.mark.asyncio
+    async def test_a_tool_call_no_model_request_chose_never_reports_asking_the_model(self, memory_storage):
+        with mock.patch.object(journal_module, "log", spec=["debug", "warning"]) as log:
+            for _ in range(3):
+                durable_run = DurableJournal(memory_storage).start_run()
+                error = ValueError("bad arguments")
+                with pytest.raises(ValueError, match="bad arguments"):
+                    await durable_run.run(
+                        "query", kind="tool", fingerprint="q", body=lambda error=error: raise_(error)
+                    )
+                durable_run.fail(error)
+
+        assert asked_model_again(log) == []
+
+    @pytest.mark.asyncio
+    async def test_a_model_request_that_fails_twice_does_not_rerun_the_requests_before_it(
+        self, memory_storage
+    ):
+        for _ in range(2):
+            run = DurableJournal(memory_storage).start_run()
+            await run.run("model", kind="model", fingerprint="m1", body=lambda: ok("call query"))
+            await run.run("query", kind="tool", fingerprint="q", body=lambda: ok("3 rows"))
+            rate_limited = RuntimeError("429")
+            with pytest.raises(RuntimeError):
+                await run.run(
+                    "model", kind="model", fingerprint="m2", body=lambda error=rate_limited: raise_(error)
+                )
+            run.fail(rate_limited)
+
+        retry = DurableJournal(memory_storage).start_run()
+        first = await retry.run("model", kind="model", fingerprint="m1", body=lambda: ok("asked again"))
+
+        assert first == "call query"
 
 
 class TestReject:

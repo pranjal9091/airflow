@@ -150,8 +150,9 @@ async def run_durably(
     function tools of an agent reached through ``handoff()``, and its model too unless the
     agent's ``model`` is a model name or not set, and streamed runs. A tool call that fails,
     including one whose exception ``failure_error_function`` turns into text for the model,
-    is not recorded either, so a retry runs it again. A replayed model call reports no
-    usage, since it costs nothing.
+    is not recorded either, so a retry runs it again. Once a call has failed the run on two
+    attempts in a row, the next retry asks the model again from the request that chose it. A
+    replayed model call reports no usage, since it costs nothing.
 
     A ``session`` makes every retry run live: the SDK adds the failed try's prompt to it
     before the first model call, so that call no longer asks what it asked then.
