@@ -48,7 +48,8 @@ class ToolApprovalError(RuntimeError):
     Raised when a run paused for tool approval cannot resume safely.
 
     The saved transcript, or the agent's rendered toolset ids, no longer match what the
-    reviewer saw. A retry starts a fresh run.
+    reviewer saw. A retry runs the agent again and asks the reviewer again; on Airflow 3.3,
+    where a task instance asks once, the retry fails instead.
     """
 
 
@@ -68,8 +69,8 @@ class UnsupportedToolDeferralError(AirflowFailException):
     Raised when an agent defers a tool call that ``AgentOperator`` cannot resolve.
 
     Either the tool hands its work to an external system, or it needs approval where
-    approval is not available (before Airflow 3.3, or with ``durable``,
-    ``enable_hitl_review``, code mode or a ``SandboxToolset``). A retry would repeat
+    approval is not available (before Airflow 3.3, or with ``enable_hitl_review``, code
+    mode or a ``SandboxToolset``). A retry would repeat
     the same call, so the task fails without retrying.
     """
 

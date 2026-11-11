@@ -263,7 +263,8 @@ class DurableRun:
     def __init__(self, journal: DurableJournal, key: str, *, started_before: bool = True) -> None:
         self.journal = journal
         self.key = key
-        self.diverged = False
+        # The position this attempt diverged at, once it has.
+        self._diverged_at: int | None = None
         self._position = 0
         # Whether an earlier attempt started this run. When none did, the journal holds nothing
         # of it to read back: no step, no entry about the run, no step beyond this attempt's.
@@ -299,6 +300,11 @@ class DurableRun:
         self._tool_failure: dict[str, Any] = {}
         # Steps ``reserve`` numbered for the latest model response, by tool call id, until taken.
         self._reserved: dict[str, JournalStep] = {}
+
+    @property
+    def diverged(self) -> bool:
+        """Whether this attempt took a different path from the previous one, so nothing after it replays."""
+        return self._diverged_at is not None
 
     @property
     def position(self) -> int:
@@ -546,12 +552,49 @@ class DurableRun:
             # The entry at the previous attempt's point is still that attempt's, as this one
             # recorded nothing over it (the step there raised, say), so a retry must not replay it.
             diverge_from, rerun_model = previous, self._model_at_fault
-        meta = {
-            "diverge_from": diverge_from,
-            "high_water": max(self._high_water, self._position),
-            "model_at_fault": rerun_model,
-            "tool_failure": tool_failure,
-        }
+        self._save_meta(
+            {
+                "diverge_from": diverge_from,
+                "high_water": max(self._high_water, self._position),
+                "model_at_fault": rerun_model,
+                "tool_failure": tool_failure,
+            }
+        )
+
+    def pause(self) -> None:
+        """
+        Keep what this attempt recorded for the task to resume from, as it waits for input.
+
+        Not a failure: the resumed task runs the agent again, which replays every step this
+        attempt recorded and runs the step that paused live, now with its input. So unlike
+        :meth:`fail`, which can hand a retry back to where an earlier attempt failed, this
+        trusts everything the attempt recorded. An entry an earlier attempt left at a position
+        this one did not record is deleted instead, so the resume runs that step live rather
+        than replay it.
+        """
+        self._load_meta()
+        end = max(self._high_water, self._position)
+        # Before both points every claimed step replayed, so no position there holds a stale entry.
+        untrusted = [p for p in (self._diverged_at, self._diverge_from) if p is not None]
+        if untrusted:
+            self.journal.storage.delete_steps(
+                [
+                    build_step_key(self.key, position)
+                    for position in range(min(untrusted), end)
+                    if position not in self._saved
+                ]
+            )
+        # Also on a first attempt: a later pause that goes less far must still delete this one's steps.
+        self._save_meta(
+            {
+                "diverge_from": None,
+                "high_water": end,
+                "model_at_fault": False,
+                "tool_failure": self._tool_failure or None,
+            }
+        )
+
+    def _save_meta(self, meta: dict[str, Any]) -> None:
         if self.journal._ensure_runs_listed():
             self._meta_written = True
             self.journal.storage.save_step(build_run_meta_key(self.key), meta)
@@ -609,7 +652,8 @@ class DurableRun:
         self._diverge(step.position, step.name, reason=reason)
 
     def _diverge(self, position: int, name: str, *, reason: str) -> None:
-        self.diverged = True
+        if self._diverged_at is None:
+            self._diverged_at = position
         self._peeked.clear()
         log.warning(
             "Durable: the run took a different path from the previous attempt; this step and "
@@ -801,6 +845,13 @@ def build_task_storage(context: Context) -> DurableStorageProtocol:
 
 _ACTIVE_JOURNAL: ContextVar[DurableJournal | None] = ContextVar("commonai_durable_journal", default=None)
 _EXECUTING_STEP: ContextVar[JournalStep | None] = ContextVar("commonai_durable_step", default=None)
+
+
+def executing_step() -> JournalStep | None:
+    """Return the journal step whose work is running now, such as a tool call, or ``None`` outside one."""
+    return _EXECUTING_STEP.get()
+
+
 # The journal for the task attempt this process is running, when no caller set one
 # explicitly. Keyed by the attempt, so a second attempt in the same process (a test,
 # a long-lived worker) never reuses the first attempt's runs.
